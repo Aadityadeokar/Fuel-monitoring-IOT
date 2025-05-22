@@ -1,0 +1,12 @@
+ESP8266   | Components
+----------------------
+3.3V      | GPS VCC, MPU6050 VCC, MQ2 VCC
+GND       | All GND
+D1        | Buzzer
+D2        | GPS RX
+D3        | GPS TX
+D4        | Status LED
+D5        | Solenoid Valve
+D6        | Exhaust Fan
+D7        | Emergency Button
+A0        | MQ2 AOUT + Fuel Sensor
