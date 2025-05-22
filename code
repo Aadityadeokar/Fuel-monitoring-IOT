@@ -1,0 +1,209 @@
+#include <ESP8266WiFi.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// WiFi Configuration
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* server = "api.thingspeak.com";
+const String apiKey = "YOUR_THINGSPEAK_API_KEY";
+
+#define MQ2_PIN A0
+#define FUEL_SENSOR_PIN A0
+#define BUZZER_PIN D1
+#define SOLENOID_VALVE D5
+#define EXHAUST_FAN D6
+#define EMERGENCY_BUTTON D7
+#define STATUS_LED D4
+
+// GPS Configuration
+static const int RXPin = D2, TXPin = D3;
+static const uint32_t GPSBaud = 9600;
+
+// Sensor Objects
+TinyGPSPlus gps;
+SoftwareSerial ss(RXPin, TXPin);
+Adafruit_MPU6050 mpu;
+
+// sample Calibration Data
+const float tankCapacity = 5000.0; // Liters
+float baseFuelLevel = 0.0;
+bool deliveryActive = false;
+
+// Timing Configuration
+const unsigned long UPLOAD_INTERVAL = 5 * 60 * 1000; // 5 minutes
+unsigned long previousUploadTime = 0;
+
+WiFiClient client;
+
+void setup() {
+  Serial.begin(115200);
+  ss.begin(GPSBaud);
+  Wire.begin();
+  
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(SOLENOID_VALVE, OUTPUT);
+  pinMode(EXHAUST_FAN, OUTPUT);
+  pinMode(STATUS_LED, OUTPUT);
+  pinMode(EMERGENCY_BUTTON, INPUT_PULLUP);
+  
+  // Default Safe State
+  digitalWrite(SOLENOID_VALVE, LOW);
+  digitalWrite(EXHAUST_FAN, LOW);
+  digitalWrite(STATUS_LED, LOW);
+
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
+    while (1) delay(10);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+
+  connectToWiFi();
+}
+
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
+    digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected!");
+    digitalWrite(STATUS_LED, HIGH);
+  } else {
+    Serial.println("\nConnection Failed!");
+    digitalWrite(STATUS_LED, LOW);
+  }
+}
+
+float readFuelLevel() {
+  const int samples = 10;
+  long total = 0;
+  for(int i=0; i<samples; i++) {
+    total += analogRead(FUEL_SENSOR_PIN);
+    delay(10);
+  }
+  return map(total/samples, 0, 1023, 0, tankCapacity);
+}
+
+float detectGas() {
+  int sensorValue = analogRead(MQ2_PIN);
+  float voltage = sensorValue * (3.3 / 1023.0);
+  float rs = (5.0 - voltage) / voltage;
+  return pow(10, (log10(rs/9.8) - 2.0) / 0.6); // Calibrated for LPG
+}
+
+bool collisionDetected() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float acceleration = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
+  return acceleration > 20.0; // 20 m/s² threshold
+}
+
+void handleSafety(float gasLevel, bool collision) {
+  if(digitalRead(EMERGENCY_BUTTON) == LOW) {
+    emergencyShutdown();
+    return;
+  }
+
+  if(gasLevel > 1000 || collision) {
+    digitalWrite(EXHAUST_FAN, HIGH);
+    digitalWrite(SOLENOID_VALVE, HIGH);
+    tone(BUZZER_PIN, 1000);
+    
+    if(millis() - lastActivation > 30000) {
+      ESP.deepSleep(0);
+    }
+  } else {
+    digitalWrite(EXHAUST_FAN, LOW);
+    digitalWrite(SOLENOID_VALVE, LOW);
+    noTone(BUZZER_PIN);
+  }
+}
+
+void emergencyShutdown() {
+  digitalWrite(SOLENOID_VALVE, HIGH);
+  digitalWrite(EXHAUST_FAN, HIGH);
+  tone(BUZZER_PIN, 2000);
+  ESP.deepSleep(0);
+}
+
+void updateGPS() {
+  while (ss.available() > 0) {
+    if (gps.encode(ss.read())) {
+      if (gps.location.isValid()) {
+        Serial.print("Lat: ");
+        Serial.print(gps.location.lat(), 6);
+        Serial.print(" Lng: ");
+        Serial.println(gps.location.lng(), 6);
+      }
+    }
+  }
+}
+
+void sendDataToCloud() {
+  String postStr = "api_key=" + apiKey;
+  postStr += "&field1=" + String(readFuelLevel());
+  postStr += "&field2=" + String(detectGas());
+  postStr += "&field3=" + String(gps.location.lat(), 6);
+  postStr += "&field4=" + String(gps.location.lng(), 6);
+  
+  if (client.connect(server, 80)) {
+    client.print("POST /update HTTP/1.1\n");
+    client.print("Host: " + String(server) + "\n");
+    client.print("Connection: close\n");
+    client.print("Content-Type: application/x-www-form-urlencoded\n");
+    client.print("Content-Length: " + String(postStr.length()) + "\n\n");
+    client.print(postStr);
+    
+    unsigned long timeout = millis();
+    while(!client.available() && millis() - timeout < 5000) {
+      delay(10);
+    }
+    client.stop();
+  }
+}
+
+void loop() {
+  updateGPS();
+  
+  float currentFuel = readFuelLevel();
+  float gasLevel = detectGas();
+  bool collision = collisionDetected();
+  
+  handleSafety(gasLevel, collision);
+  
+  // Delivery detection logic
+  if (!deliveryActive && (baseFuelLevel - currentFuel) > 50) {
+    deliveryActive = true;
+  }
+  
+  if (deliveryActive && abs(currentFuel - baseFuelLevel) < 5) {
+    baseFuelLevel = currentFuel;
+    deliveryActive = false;
+  }
+
+  // Regular data upload
+  if (millis() - previousUploadTime >= UPLOAD_INTERVAL) {
+    sendDataToCloud();
+    previousUploadTime = millis();
+  }
+
+  // Maintain WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToWiFi();
+  }
+
+  delay(100);
+  yield();
+}
